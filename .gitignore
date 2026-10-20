@@ -1,0 +1,50 @@
+# ---- Build output ----
+# Arduino / arduino-cli sketch builds and Gradle builds
+build/
+# ...except the example builds the reverse-engineering guide uses
+!/archive/build/
+
+# ---- Android / Gradle ----
+.gradle/
+.kotlin/
+.cxx/
+.externalNativeBuild/
+local.properties
+captures/
+*.apk
+*.aab
+*.ap_
+*.dex
+
+# Android Studio / IntelliJ
+.idea/
+*.iml
+.navigation/
+
+# Signing keys: never commit these
+*.jks
+*.keystore
+keystore.properties
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# ---- Tool output ----
+# Logs and CSVs written by can_tools/analyze_cells.py or exported from the app
+*.log
+can_log_*.tsv
+cells*.csv
+# Raw binary written by re_tools/hexinfo.py --bin
+/backup.bin
+/archive/backup.bin
+
+# ---- Editors / OS ----
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+desktop.ini

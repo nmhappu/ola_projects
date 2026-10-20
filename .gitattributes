@@ -1,0 +1,15 @@
+# Normalise text files; check them out with the platform's line endings
+* text=auto
+
+# Shell scripts must keep LF or they won't run on Linux/macOS
+gradlew text eol=lf
+*.sh text eol=lf
+# Windows batch files keep CRLF
+*.bat text eol=crlf
+
+# Firmware dumps and builds: keep byte-for-byte
+*.hex -text
+*.elf binary
+*.bin binary
+*.eep -text
+*.jar binary

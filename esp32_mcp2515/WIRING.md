@@ -1,0 +1,106 @@
+# Wiring: ESP32 with the MCP2515 CAN module
+
+This variant reuses the **MCP2515 module from the Arduino Uno tool**, so you
+can build it with what you already have. The LCD and the three buttons are no
+longer used; the BMS Remote app replaces them. When you get an SN65HVD230
+board, `../esp32_sn65hvd230` is the simpler build (no level shifter).
+
+## New wiring
+
+```
+   ESP32 DevKit             (level shifter)          MCP2515 module        Scooter CAN
+  +-------------+          LV          HV          +---------------+
+  |         3V3 |--------- LV          HV ---------| VCC  <- 5V    |
+  |     5V(VIN) |----------------------------------| VCC           |
+  |         GND |------- GND          GND ---------| GND           |
+  |      GPIO 5 |------- LV1          HV1 ---------| CS            |
+  |     GPIO 19 |------- LV2          HV2 ---------| SO            |
+  |     GPIO 23 |------- LV3          HV3 ---------| SI            |
+  |     GPIO 18 |------- LV4          HV4 ---------| SCK           |
+  +-------------+                                  |      INT (nc) |
+                                                   |          H    |---------- CAN-H
+                                                   |          L    |---------- CAN-L
+                                                   +---------------+
+```
+
+| MCP2515 pin | ESP32 pin | Through the level shifter? |
+|---|---|---|
+| VCC | 5V (VIN) | No |
+| GND | GND | No (also to the shifter's GND) |
+| CS | GPIO 5 | Yes |
+| SO | GPIO 19 | Yes (this one matters most: it outputs 5 V) |
+| SI | GPIO 23 | Yes |
+| SCK | GPIO 18 | Yes |
+| INT | not connected | |
+
+Level shifter (a 4-channel BSS138 board): **LV** to ESP32 3V3, **HV** to 5V,
+**GND** to GND.
+
+The scooter's CAN wires stay on the module's **H** and **L** screw terminals,
+exactly as before.
+
+## Where each old wire goes
+
+The wires aren't labelled, so trace each one back to its **Uno** pin and move
+its Uno end as below. The module end stays where it is.
+
+### MCP2515 module (reused)
+
+| Old: Uno pin | MCP2515 pin | New: ESP32 pin |
+|---|---|---|
+| **D10** | CS | **GPIO 5** (via shifter) |
+| **D12** | SO | **GPIO 19** (via shifter) |
+| **D11** | SI | **GPIO 23** (via shifter) |
+| **D13** | SCK | **GPIO 18** (via shifter) |
+| **5V** | VCC | **5V / VIN** |
+| **GND** | GND | **GND** |
+| (none) | INT | not connected |
+| (scooter) | H, L terminals | unchanged |
+
+### 16x2 LCD with I2C backpack (no longer needed)
+
+| Old: Uno pin | LCD backpack pin | New |
+|---|---|---|
+| A4 | SDA | Not used |
+| A5 | SCL | Not used |
+| 5V | VCC | Not used |
+| GND | GND | Not used |
+
+### Buttons (no longer needed; the app has them)
+
+| Old: Uno pin | Button | Now in the app |
+|---|---|---|
+| D7 | Next | (not needed, actions are separate buttons) |
+| D5 | Previous | (not needed) |
+| D6 | Select | Fetch data / BMS reset / System reset buttons |
+| GND | other side of all three | Not used |
+
+### Power
+
+| Old | New |
+|---|---|
+| Whatever fed the Uno (USB, barrel jack, or VIN) | ESP32 **USB**, or **5V/VIN** pin from a 5 V supply |
+
+**If the Uno was powered from the scooter's 12 V through its barrel jack or
+VIN pin, don't connect that to the ESP32.** The DevKit's VIN pin expects 5 V.
+Put a 12 V to 5 V buck converter in between, or power the ESP32 from a USB
+power bank. The MCP2515 module takes its 5 V from the ESP32's VIN pin.
+
+## Without a level shifter
+
+It usually works for a quick bench test, but it is outside both chips' specs:
+the module's SO pin sends 5 V into GPIO 19, and at 5 V the MCP2515 may misread
+the ESP32's 3.3 V signals. Use the shifter for anything connected to the
+scooter, or switch to the SN65HVD230 build.
+
+## Checks before connecting to the scooter
+
+1. **Crystal.** The firmware assumes the module's crystal is **8 MHz** (marked
+   8.000 on the silver can), as the original Uno firmware did. A 16 MHz module
+   needs `MCP_16MHZ` in `setupCAN()`.
+2. **Terminator jumper (J1).** Leave it as it was on the Uno tool.
+3. **First power-up.** Open the Serial Monitor at 115200 baud. You should see
+   `OLA BMS Tool XXXX (MCP2515) ready`.
+4. **If the app reports "No reply on the CAN bus"**, the scooter is off or the
+   CAN wires aren't connected. "CAN bus errors" usually means CAN-H and CAN-L
+   are swapped or the crystal setting is wrong.

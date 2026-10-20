@@ -1,0 +1,58 @@
+# Function names identified in backup.hex - used by re_tools\asm.py
+# Format:  address  name        (anything after # is a comment)
+# main, the ISRs and __bad_interrupt are named automatically.
+
+# --- Arduino core ---
+0x016a  digitalRead          # pin in r24, returns r24:r25
+0x01bc  digitalWrite         # pin in r24, value in r22
+0x0222  pinMode              # pin in r24, mode in r22 (2 = INPUT_PULLUP)
+0x02ce  delay                # ms in r22..r25
+0x03f2  HardwareSerial_available
+0x040a  Serial_available_bool
+0x22b4  exit
+
+# --- SPI / Wire ---
+0x0550  SPI_transfer         # byte in r24, returns r24
+0x055e  SPI_begin
+0x061a  Wire_begin
+
+# --- LiquidCrystal_I2C (object at RAM 0x036D) ---
+0x07a4  lcd_expanderWrite
+0x0978  Print_write_str
+0x0a1a  lcd_print_str        # string address in r24:r25
+0x0a1e  lcd_write4bits
+0x0a50  lcd_send             # value r22, mode r20 (0 = command)
+0x0a8a  lcd_print_int
+0x0adc  lcd_setCursor        # col r24, row r22
+0x0b42  lcd_print_float      # float in r22..r25, decimals r20
+0x0cfe  lcd_clear
+
+# --- MCP2515 (autowp library, object at RAM 0x0366, CS pin stored there = 10) ---
+0x0218  mcp_endSPI
+0x0df4  mcp_startSPI
+0x0e48  mcp_readRegister
+0x0e6e  mcp_modifyRegister
+0x0ea0  mcp_setMode          # 0x80 = config, 0x00 = normal
+0x0f1a  mcp_setRegister      # reg r24, value r22
+0x0f40  mcp_setRegisters
+0x0fd2  mcp_readMessage_rxb
+
+# --- the sketch itself ---
+0x0d14  triggerDone
+0x0d2c  updateMenu
+0x10ee  readCAN
+0x128e  sendCAN              # CAN id in r22..r25
+0x17ba  global_constructors  # lcd(0x27,16,2), mcp2515(10), Serial
+
+# --- avr-libc floating point ---
+0x1ebe  __divsf3             # float divide
+0x2000  __floatunsisf        # unsigned long -> float
+
+# --- RAM variables (globals) ---
+ram 0x0100 menu              # int, starts at 1
+ram 0x01e0 rawVoltage        # unsigned int, mV
+ram 0x01e2 soc               # int, %
+ram 0x01e4 packVoltage       # float (4 bytes)
+ram 0x02a8 canMsg.can_id     # 4 bytes
+ram 0x02ac canMsg.can_dlc
+ram 0x02b0 canMsg.data       # data[0]..data[7]
