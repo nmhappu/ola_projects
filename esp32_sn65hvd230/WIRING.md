@@ -92,6 +92,13 @@ VIN pin, don't connect that to the ESP32.** The DevKit's VIN pin expects
 5 V. Put a 12 V to 5 V buck converter in between, or power the ESP32 from a
 USB power bank.
 
+## Finding the scooter's CAN wires
+
+They're the two wires on the old MCP2515 module's **H** and **L** screw
+terminal. Label them before unscrewing, and see "Finding the scooter's CAN
+wires" in [`../esp32_mcp2515/WIRING.md`](../esp32_mcp2515/WIRING.md) for how
+to identify them with a multimeter if the labels get lost.
+
 ## Checks before connecting to the scooter
 
 1. **Terminator.** Most SN65HVD230 boards have a 120 ohm resistor between

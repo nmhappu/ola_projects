@@ -44,6 +44,25 @@ exactly as before.
 The wires aren't labelled, so trace each one back to its **Uno** pin and move
 its Uno end as below. The module end stays where it is.
 
+### Finding the pins on the Uno
+
+Hold the Uno with the USB socket and power jack on the **left**:
+
+- **Top edge** (digital header), left to right:
+  `SCL SDA AREF GND D13 D12 D11 D10 D9 D8 | D7 D6 D5 D4 D3 D2 D1 D0`
+- **Bottom edge** (power and analog), left to right:
+  `(blank) IOREF RESET 3.3V 5V GND GND Vin | A0 A1 A2 A3 A4 A5`
+- **ICSP header**: the 6-pin block on the right edge.
+
+Two things to watch for:
+- **LCD wires** may be on the `SDA`/`SCL` pins at the top left instead of
+  `A4`/`A5`. They are the same signals, and both are being removed anyway.
+- **MCP2515 wires** may be on the **ICSP header** instead of D11–D13. On ICSP,
+  MISO = D12 (to SO), SCK = D13 (to SCK), MOSI = D11 (to SI). CS is always on
+  a normal pin (D10 in the original firmware).
+- Several wires may share one **5V** or **GND** pin, or come from a breadboard
+  rail. They all go to the matching ESP32 pin.
+
 ### MCP2515 module (reused)
 
 | Old: Uno pin | MCP2515 pin | New: ESP32 pin |
@@ -85,6 +104,34 @@ its Uno end as below. The module end stays where it is.
 VIN pin, don't connect that to the ESP32.** The DevKit's VIN pin expects 5 V.
 Put a 12 V to 5 V buck converter in between, or power the ESP32 from a USB
 power bank. The MCP2515 module takes its 5 V from the ESP32's VIN pin.
+
+## Finding the scooter's CAN wires
+
+The Uno tool already taps the scooter's CAN bus: it's the two wires on the
+MCP2515 module's **H** and **L** screw terminal. Reuse that tap; there's no
+need to look for a new one. (I couldn't find a published pinout for the
+Ola S1 X's diagnostic connector, so the existing tap is the reliable route.)
+
+1. **Label them before unscrewing anything.** Put a strip of tape on the wire
+   in **H** and write "H", and do the same for **L**. Also check whether a
+   third wire (ground) runs from the tool to the scooter.
+2. **Leave the scooter end alone.** Only the module end moves, and with the
+   MCP2515 version it doesn't move at all.
+3. **If the labels got lost, check with a multimeter:**
+   - **Scooter off:** resistance between the two wires. About **60 Ω** means
+     it's the CAN pair (two 120 Ω terminators in parallel); about 120 Ω is
+     also CAN (one terminator on that branch).
+   - **Scooter on:** DC voltage from each wire to scooter ground. Both sit
+     near **2.5 V**; **CAN-H** reads slightly higher (about 2.6–3.0 V) and
+     **CAN-L** slightly lower (about 2.0–2.4 V).
+4. **Ground.** If the old tool had a ground wire to the scooter, connect it to
+   the ESP32's GND too.
+5. **Swapped?** If the app reports "CAN bus errors", swap H and L.
+
+**Safety:** move wires with the scooter off. The CAN wires only carry a few
+volts. Stay away from the thick battery cables and the motor controller's
+power terminals: the pack is up to about 58 V and can deliver very high
+current. Don't pierce wires to find the CAN pair; use the existing tap.
 
 ## Without a level shifter
 
