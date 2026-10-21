@@ -113,6 +113,9 @@ const uint8_t SPI_READ_RX0    = 0x90;   // read receive buffer 0 from its first 
 const uint8_t SPI_READ_RX1    = 0x94;   // read receive buffer 1 from its first id byte
 const uint8_t STATUS_RX0      = 0x01;
 const uint8_t STATUS_RX1      = 0x02;
+const uint8_t SPI_READ        = 0x03;   // read register: instruction, address, then data
+const uint8_t REG_CNF2        = 0x29;   // bit timing register setupCAN() writes
+const int MAX_RX_ROUNDS       = 32;     // a real chip is empty long before this
 
 MCP2515 mcp2515(PIN_CAN_CS, SPI_CLOCK);
 SPISettings spiSettings(SPI_CLOCK, MSBFIRST, SPI_MODE0);
@@ -241,6 +244,19 @@ uint8_t readStatus() {
   return status;
 }
 
+// True if the MCP2515 answers: CNF2 reads back what setupCAN() wrote. With the
+// module unpowered or SO not connected the reads are all 0x00 or 0xFF instead.
+bool chipResponds() {
+  SPI.beginTransaction(spiSettings);
+  digitalWrite(PIN_CAN_CS, LOW);
+  SPI.transfer(SPI_READ);
+  SPI.transfer(REG_CNF2);
+  uint8_t cnf2 = SPI.transfer(0x00);
+  digitalWrite(PIN_CAN_CS, HIGH);
+  SPI.endTransaction();
+  return cnf2 == MCP_8MHz_500kBPS_CFG2;
+}
+
 // Reads a receive buffer's 13 bytes (id, dlc, data). The chip clears that
 // buffer's "full" flag by itself when CS goes high, so no extra command is needed.
 void readRxBuffer(uint8_t instruction, uint8_t *out) {
@@ -306,7 +322,11 @@ void canTask(void *) {
   uint8_t b0[13], b1[13];
   for (;;) {
     ulTaskNotifyTake(pdTRUE, 1);
-    for (;;) {
+    // Bounded: if the SPI reads are garbage (module missing or unpowered) the
+    // "frame waiting" bits never clear, and an endless loop here would starve
+    // everything else on this core.
+    int rounds = 0;
+    for (; rounds < MAX_RX_ROUNDS; rounds++) {
       xSemaphoreTake(spiMutex, portMAX_DELAY);
       uint32_t us = micros();
       uint8_t status = readStatus();
@@ -318,6 +338,10 @@ void canTask(void *) {
       if (!has0 && !has1) break;
       if (has0) handleFrame(b0, us);
       if (has1) handleFrame(b1, us);
+    }
+    if (rounds == MAX_RX_ROUNDS) {
+      vTaskDelay(pdMS_TO_TICKS(10));   // not a real chip: back off, let the rest run
+      continue;
     }
     // INT still low with both buffers empty means an error flag is holding it down.
     if (digitalRead(PIN_CAN_INT) == LOW || millis() - lastErrorCheck >= ERROR_CHECK_MS) {
@@ -504,20 +528,25 @@ void setupBLE() {
 void setup() {
   Serial.begin(115200);
 
+  // Bluetooth first, so the phone can always find the board, whatever the CAN side does.
+  setupBLE();
+  Serial.printf("%s (MCP2515) advertising over BLE (address %s)\n",
+                deviceName, BLEDevice::getAddress().toString().c_str());
+
   spiMutex = xSemaphoreCreateMutex();
   pinMode(PIN_CAN_CS, OUTPUT);
   digitalWrite(PIN_CAN_CS, HIGH);
   SPI.begin();
   setupCAN();
+  if (chipResponds())
+    Serial.println("MCP2515 found, CAN at 500 kbps");
+  else
+    Serial.println("MCP2515 not responding: check its 5 V supply and the CS/SO/SI/SCK wires");
 
   // Receive task on core 1 (Bluetooth runs on core 0), above loop()'s priority.
   xTaskCreatePinnedToCore(canTask, "can_rx", 4096, nullptr, 5, &canTaskHandle, 1);
   pinMode(PIN_CAN_INT, INPUT_PULLUP);   // pull-up keeps it idle if INT isn't wired
   attachInterrupt(digitalPinToInterrupt(PIN_CAN_INT), onCanInterrupt, FALLING);
-
-  setupBLE();
-  Serial.printf("%s (MCP2515) ready, advertising over BLE (address %s)\n",
-                deviceName, BLEDevice::getAddress().toString().c_str());
 }
 
 void loop() {
