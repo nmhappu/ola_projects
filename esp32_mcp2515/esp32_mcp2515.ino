@@ -527,6 +527,7 @@ void setupBLE() {
 
 void setup() {
   Serial.begin(115200);
+  Serial.printf("\nOLA BMS Tool (MCP2515), protocol %d, starting\n", PROTOCOL_VERSION);
 
   // Bluetooth first, so the phone can always find the board, whatever the CAN side does.
   setupBLE();
