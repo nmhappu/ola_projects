@@ -165,14 +165,28 @@ private fun Notice(text: String) {
 @OptIn(ExperimentalMaterial3ExpressiveApi::class)
 @Composable
 private fun Stats(monitor: MonitorSnapshot) {
-    Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-        StatTile("%.0f".format(Locale.US, monitor.framesPerSecond), "frames/s", Modifier.weight(1f))
-        StatTile("${monitor.rows.size}", "CAN IDs", Modifier.weight(1f))
-        StatTile(
-            "${monitor.lostFrames}", "lost",
-            Modifier.weight(1f),
-            warn = monitor.lostFrames > 0,
-        )
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            StatTile("%.0f".format(Locale.US, monitor.framesPerSecond), "frames/s", Modifier.weight(1f))
+            StatTile("${monitor.rows.size}", "CAN IDs", Modifier.weight(1f))
+            StatTile(
+                "${monitor.lostFrames}", "lost",
+                Modifier.weight(1f),
+                warn = monitor.lostFrames > 0,
+            )
+        }
+        if (monitor.lostFrames > 0) {
+            Text(
+                if (monitor.lossSplitKnown) {
+                    "Lost: ${monitor.lostAtChip} at the CAN chip · ${monitor.lostOnLink} on Bluetooth"
+                } else {
+                    "Lost frames: update the ESP32 firmware to see where they're lost"
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(start = 4.dp),
+            )
+        }
     }
 }
 

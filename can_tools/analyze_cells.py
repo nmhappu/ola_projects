@@ -23,6 +23,7 @@ Usage:
 import argparse
 import collections
 import csv
+import statistics
 import sys
 from dataclasses import dataclass, field
 
@@ -53,6 +54,12 @@ class Event:
     label: str
 
 
+def is_time(text):
+    """Times are whole milliseconds (older logs) or milliseconds with decimals (newer app)."""
+    whole, _, frac = text.partition(".")
+    return whole.isdigit() and (frac == "" or frac.isdigit())
+
+
 def parse_log(path):
     frames, events = [], []
     with open(path, encoding="utf-8", errors="replace") as f:
@@ -62,11 +69,11 @@ def parse_log(path):
                 continue
             if line.startswith("#"):
                 parts = line[1:].split(None, 2)
-                if len(parts) >= 2 and parts[0] == "mark" and parts[1].isdigit():
-                    events.append(Event(int(parts[1]), parts[2] if len(parts) > 2 else "mark"))
+                if len(parts) >= 2 and parts[0] == "mark" and is_time(parts[1]):
+                    events.append(Event(float(parts[1]), parts[2] if len(parts) > 2 else "mark"))
                 continue
             tokens = line.split()
-            if len(tokens) < 3 or not tokens[0].isdigit():
+            if len(tokens) < 3 or not is_time(tokens[0]):
                 continue  # anything else the Serial Monitor printed
             tx = tokens[-1] == "TX"
             if tx:
@@ -74,7 +81,7 @@ def parse_log(path):
             if tokens[-1] == "RTR":
                 continue
             try:
-                t = int(tokens[0])
+                t = float(tokens[0])
                 id_text = tokens[1]
                 extended = id_text.startswith("x")
                 can_id = int(id_text.lstrip("x"), 16)
@@ -135,10 +142,12 @@ def find_cell_fields(frames):
     for (can_id, extended), group in by_id.items():
         if can_id == PACK_ID and not extended:
             continue
-        # A frame whose byte 0 takes only a few values is probably multiplexed:
-        # e.g. byte 0 = 0,1,2,3 and each carries 3 cells in bytes 2-7.
+        # A frame whose byte 0 is a small index (0-15) taking a few values is probably
+        # multiplexed: e.g. byte 0 = 0,1,2,3 and each carries 3 cells in bytes 1-6.
+        # (A data byte that merely toggles, like the low byte of a cell voltage, is not.)
         first_bytes = {fr.data[0] for fr in group if fr.data}
-        mux_values = sorted(first_bytes) if 2 <= len(first_bytes) <= 8 and len(group) >= 4 * len(first_bytes) else []
+        looks_like_index = 2 <= len(first_bytes) <= 8 and max(first_bytes) < 16
+        mux_values = sorted(first_bytes) if looks_like_index and len(group) >= 4 * len(first_bytes) else []
         layouts = [(None, group, 0)] + [
             (m, [fr for fr in group if fr.data and fr.data[0] == m], 1) for m in mux_values
         ]
@@ -275,6 +284,57 @@ def sum_vs_pack(fields, pack):
     return avg_sum - avg_pack, avg_sum, avg_pack, len(checks)
 
 
+def find_cell_frames(cells):
+    """Frames carrying 2+ millivolt fields within 100 mV of each other: cells sit close
+    together even when nothing changes, unlike unrelated data that merely falls in range."""
+    by_frame = collections.defaultdict(list)
+    for f in cells:
+        if f.scale == "mV":
+            by_frame[(f.can_id, f.extended, f.mux)].append(f)
+    groups = []
+    for key, fields in by_frame.items():
+        medians = [statistics.median(v for _, v in f.samples) for f in fields]
+        if len(fields) >= 2 and max(medians) - min(medians) <= 0.1:
+            groups.append((key, sorted(fields, key=lambda f: f.offset), medians))
+    if not groups:
+        return []
+    # Keep frames whose values sit near the common level (a pack's cells are within ~0.2 V).
+    level = statistics.median(m for _, _, ms in groups for m in ms)
+    groups = [g for g in groups if all(abs(m - level) <= 0.2 for m in g[2])]
+    # A 2-value frame equal to the lowest and highest of the other cells is a min/max summary.
+    def is_summary(g):
+        others = [m for h in groups if h is not g for m in h[2]]
+        return (len(g[2]) == 2 and others
+                and abs(min(g[2]) - min(others)) <= 0.002 and abs(max(g[2]) - max(others)) <= 0.002)
+    return sorted((g for g in groups if not is_summary(g)), key=lambda g: g[0][0])
+
+
+def print_cell_frames(groups, pack):
+    print("\n== Frames that each carry several near-identical voltages (likely cells) ==")
+    if not groups:
+        print("None found.")
+        return
+    values = []
+    for (can_id, extended, mux), fields, medians in groups:
+        label = id_label(can_id, extended) + (f"[b0={mux:02X}]" if mux is not None else "")
+        order = "BE" if fields[0].big_endian else "LE"
+        print(f"  {label:<12} {order} mV  " + "  ".join(f"{m * 1000:.0f}" for m in medians))
+        values += medians
+    total, avg = sum(values), sum(values) / len(values)
+    print(f"\n{len(values)} cell-like values from {len(groups)} frames, "
+          f"{min(values):.3f}-{max(values):.3f} V, sum {total:.2f} V, average {avg:.3f} V.")
+    if pack:
+        pack_v = statistics.median(v for _, v in pack)
+        series = pack_v / avg
+        print(f"Pack {pack_v:.2f} V / average cell = {series:.2f}, so the pack looks like "
+              f"{round(series)} cells in series.")
+        if round(series) != len(values):
+            print(f"=> {len(values)} values but ~{round(series)} cells: one or more of these values "
+                  f"may be something else (a min/max/average), or the pack frame may measure elsewhere.")
+        else:
+            print("=> Count matches: these look like the individual cell-group voltages.")
+
+
 def print_replies(frames, events):
     if not events:
         return
@@ -316,6 +376,7 @@ def main():
         print(f"\nPack voltage (ID {PACK_ID:03X}): {min(v for _, v in pack):.2f}-{max(v for _, v in pack):.2f} V")
     cells = find_cell_fields(frames)
     print_cells(cells, pack)
+    print_cell_frames(find_cell_frames(cells), pack)
     print_replies(frames, events)
     if args.csv and cells:
         write_csv(args.csv, cells, pack)

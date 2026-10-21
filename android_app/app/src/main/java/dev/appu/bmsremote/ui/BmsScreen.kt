@@ -81,7 +81,7 @@ import kotlinx.coroutines.launch
 import java.util.Locale
 
 @Composable
-fun BmsScreen(onOpenMonitor: () -> Unit, viewModel: BmsViewModel = viewModel()) {
+fun BmsScreen(onOpenRide: () -> Unit, onOpenMonitor: () -> Unit, viewModel: BmsViewModel = viewModel()) {
     val connection by viewModel.connection.collectAsStateWithLifecycle()
     val status by viewModel.status.collectAsStateWithLifecycle()
     val monitor by viewModel.monitor.collectAsStateWithLifecycle()
@@ -111,6 +111,7 @@ fun BmsScreen(onOpenMonitor: () -> Unit, viewModel: BmsViewModel = viewModel()) 
             monitor.hasRecording -> "Recording ready to export"
             else -> "See, record and export raw CAN frames"
         },
+        onOpenRide = onOpenRide,
         onOpenMonitor = onOpenMonitor,
     )
 }
@@ -125,6 +126,7 @@ private fun BmsContent(
     onChoose: (String) -> Unit,
     onCommand: (BmsCommand) -> Unit,
     monitorSubtitle: String,
+    onOpenRide: () -> Unit,
     onOpenMonitor: () -> Unit,
 ) {
     var confirm by remember { mutableStateOf<BmsCommand?>(null) }
@@ -153,7 +155,7 @@ private fun BmsContent(
                 onBmsReset = { confirm = BmsCommand.BmsReset },
                 onSystemReset = { confirm = BmsCommand.SystemReset },
             )
-            MonitorEntry(monitorSubtitle, onOpenMonitor)
+            ToolsSection(monitorSubtitle, onOpenRide, onOpenMonitor)
         }
     }
 
@@ -410,7 +412,7 @@ private fun Actions(
 
 @OptIn(ExperimentalMaterial3ExpressiveApi::class)
 @Composable
-private fun MonitorEntry(subtitle: String, onClick: () -> Unit) {
+private fun ToolsSection(monitorSubtitle: String, onOpenRide: () -> Unit, onOpenMonitor: () -> Unit) {
     val colors = MaterialTheme.colorScheme
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Text(
@@ -418,32 +420,54 @@ private fun MonitorEntry(subtitle: String, onClick: () -> Unit) {
             style = MaterialTheme.typography.titleMediumEmphasized,
             modifier = Modifier.padding(start = 4.dp, top = 8.dp),
         )
-        Surface(
-            onClick = onClick,
-            shape = MaterialTheme.shapes.extraLarge,
-            color = colors.surfaceContainer,
-            modifier = Modifier.fillMaxWidth(),
+        ToolEntry(
+            icon = R.drawable.ic_speed,
+            title = "Ride mode",
+            subtitle = "Live speed, power, regen and cells, with graphs",
+            badge = colors.primaryContainer,
+            onBadge = colors.onPrimaryContainer,
+            onClick = onOpenRide,
+        )
+        ToolEntry(
+            icon = R.drawable.ic_list,
+            title = "CAN monitor",
+            subtitle = monitorSubtitle,
+            badge = colors.tertiaryContainer,
+            onBadge = colors.onTertiaryContainer,
+            onClick = onOpenMonitor,
+        )
+    }
+}
+
+@OptIn(ExperimentalMaterial3ExpressiveApi::class)
+@Composable
+private fun ToolEntry(icon: Int, title: String, subtitle: String, badge: Color, onBadge: Color, onClick: () -> Unit) {
+    val colors = MaterialTheme.colorScheme
+    Surface(
+        onClick = onClick,
+        shape = MaterialTheme.shapes.extraLarge,
+        color = colors.surfaceContainer,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Row(
+            modifier = Modifier.padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(16.dp),
         ) {
-            Row(
-                modifier = Modifier.padding(16.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(16.dp),
+            Box(
+                modifier = Modifier
+                    .size(44.dp)
+                    .clip(MaterialShapes.Cookie9Sided.toShape())
+                    .background(badge),
+                contentAlignment = Alignment.Center,
             ) {
-                Box(
-                    modifier = Modifier
-                        .size(44.dp)
-                        .clip(MaterialShapes.Cookie9Sided.toShape())
-                        .background(colors.tertiaryContainer),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    Icon(painterResource(R.drawable.ic_list), contentDescription = null, tint = colors.onTertiaryContainer)
-                }
-                Column(Modifier.weight(1f)) {
-                    Text("CAN monitor", style = MaterialTheme.typography.titleMediumEmphasized)
-                    Text(subtitle, style = MaterialTheme.typography.bodyMedium, color = colors.onSurfaceVariant)
-                }
-                Icon(painterResource(R.drawable.ic_chevron_right), contentDescription = null, tint = colors.onSurfaceVariant)
+                Icon(painterResource(icon), contentDescription = null, tint = onBadge)
             }
+            Column(Modifier.weight(1f)) {
+                Text(title, style = MaterialTheme.typography.titleMediumEmphasized)
+                Text(subtitle, style = MaterialTheme.typography.bodyMedium, color = colors.onSurfaceVariant)
+            }
+            Icon(painterResource(R.drawable.ic_chevron_right), contentDescription = null, tint = colors.onSurfaceVariant)
         }
     }
 }
@@ -646,6 +670,7 @@ private fun BmsContentPreview() {
             onChoose = {},
             onCommand = {},
             monitorSubtitle = "See, record and export raw CAN frames",
+            onOpenRide = {},
             onOpenMonitor = {},
         )
     }

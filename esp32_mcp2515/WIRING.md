@@ -17,10 +17,11 @@ board, `../esp32_sn65hvd230` is the simpler build (no level shifter).
   |     GPIO 19 |------- LV2          HV2 ---------| SO            |
   |     GPIO 23 |------- LV3          HV3 ---------| SI            |
   |     GPIO 18 |------- LV4          HV4 ---------| SCK           |
-  +-------------+                                  |      INT (nc) |
-                                                   |          H    |---------- CAN-H
-                                                   |          L    |---------- CAN-L
-                                                   +---------------+
+  |      GPIO 4 |----+---[ 10 kΩ ]-----------------| INT           |
+  +-------------+    |                             |          H    |---------- CAN-H
+                  [ 20 kΩ ]                        |          L    |---------- CAN-L
+                     |                             +---------------+
+                    GND
 ```
 
 | MCP2515 pin | ESP32 pin | Through the level shifter? |
@@ -31,10 +32,24 @@ board, `../esp32_sn65hvd230` is the simpler build (no level shifter).
 | SO | GPIO 19 | Yes (this one matters most: it outputs 5 V) |
 | SI | GPIO 23 | Yes |
 | SCK | GPIO 18 | Yes |
-| INT | not connected | |
+| INT | GPIO 4 | No: through a resistor divider instead (below) |
 
 Level shifter (a 4-channel BSS138 board): **LV** to ESP32 3V3, **HV** to 5V,
 **GND** to GND.
+
+### INT wire (divider)
+
+INT tells the ESP32 the moment a frame arrives, so it can empty the MCP2515's
+2-frame buffer before the next frame overwrites it. INT is a 5 V output, so it
+goes through two resistors instead of the shifter (all 4 shifter channels are
+already used):
+
+- **10 kΩ** from MCP2515 **INT** to ESP32 **GPIO 4**
+- **20 kΩ** from ESP32 **GPIO 4** to **GND**
+
+That brings 5 V down to about 3.3 V. Any pair in the same 1 : 2 ratio works
+(e.g. 4.7 kΩ + 10 kΩ). Without the INT wire the firmware still works, but
+falls back to checking the chip every 1 ms and loses more frames on a busy bus.
 
 The scooter's CAN wires stay on the module's **H** and **L** screw terminals,
 exactly as before.
@@ -73,7 +88,7 @@ Two things to watch for:
 | **D13** | SCK | **GPIO 18** (via shifter) |
 | **5V** | VCC | **5V / VIN** |
 | **GND** | GND | **GND** |
-| (none) | INT | not connected |
+| (none) | INT | **new wire:** **GPIO 4** via the 10 kΩ / 20 kΩ divider |
 | (scooter) | H, L terminals | unchanged |
 
 ### 16x2 LCD with I2C backpack (no longer needed)

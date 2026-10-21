@@ -102,6 +102,7 @@ class BmsBleClient(context: Context, private val scope: CoroutineScope) {
 
     /** Called on a Bluetooth thread with each batch of raw CAN frames. */
     @Volatile var rawListener: ((List<CanFrame>) -> Unit)? = null
+    private val decoder = CanPacketDecoder()
 
     fun connect() {
         if (connectJob?.isActive == true) return
@@ -253,13 +254,14 @@ class BmsBleClient(context: Context, private val scope: CoroutineScope) {
             writeDescriptor(g, rawCccd, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
             _canMonitorSupported.value = true
         }
-        read(g, statusChar)?.let(BmsStatus::parse)?.let { _status.value = it }
+        read(g, statusChar)?.let(BmsStatus::parse)?.let(::setStatus)
 
         _connection.value = ConnectionState.Connected(name)
     }
 
     /** Asks the ESP32 to forward every CAN frame; they arrive through [rawListener]. */
     fun startCanMonitor() {
+        decoder.reset()
         gatt?.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
         val payload = mtu - 3
         sendBytes(byteArrayOf(BmsCommand.StartRaw.code, (payload and 0xFF).toByte(), (payload shr 8).toByte()))
@@ -355,7 +357,12 @@ class BmsBleClient(context: Context, private val scope: CoroutineScope) {
     }
 
     private fun onStatusBytes(value: ByteArray) {
-        BmsStatus.parse(value)?.let { _status.value = it }
+        BmsStatus.parse(value)?.let(::setStatus)
+    }
+
+    private fun setStatus(status: BmsStatus) {
+        decoder.protocolVersion = status.protocolVersion
+        _status.value = status
     }
 
     private fun closeGatt() {
@@ -371,7 +378,7 @@ class BmsBleClient(context: Context, private val scope: CoroutineScope) {
     private fun onCharacteristicValue(c: BluetoothGattCharacteristic, value: ByteArray) {
         when (c.uuid) {
             BmsProtocol.STATUS_UUID -> onStatusBytes(value)
-            BmsProtocol.RAW_UUID -> rawListener?.invoke(CanFrame.parseRecords(value))
+            BmsProtocol.RAW_UUID -> rawListener?.invoke(decoder.decode(value))
         }
     }
 

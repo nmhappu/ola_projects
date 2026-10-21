@@ -18,13 +18,20 @@ data class MonitorSnapshot(
     val rows: List<IdRow> = emptyList(),
     val framesPerSecond: Float = 0f,
     val totalFrames: Long = 0,
-    val lostFrames: Int = 0,
+    /** Frames lost at the CAN chip (or in total, with older firmware). */
+    val lostAtChip: Int = 0,
+    /** Frames lost on the Bluetooth link. */
+    val lostOnLink: Int = 0,
+    /** False with older firmware, which reports one combined figure in [lostAtChip]. */
+    val lossSplitKnown: Boolean = true,
     val recording: Boolean = false,
     val recordedFrames: Int = 0,
     val recordingMs: Long = 0,
     val hasRecording: Boolean = false,
     val recordingFull: Boolean = false,
-)
+) {
+    val lostFrames: Int get() = lostAtChip + lostOnLink
+}
 
 /**
  * Keeps the live per-ID table and, while recording, every frame in order.
@@ -40,7 +47,7 @@ class CanRecorder {
         val changedAt = LongArray(8)
     }
 
-    private class Mark(val timeMs: Long, val label: String)
+    private class Mark(val timeUs: Long, val label: String)
 
     private val lock = Any()
     private val ids = HashMap<Long, IdState>()
@@ -48,7 +55,7 @@ class CanRecorder {
     private var total = 0L
     private var totalAtSnapshot = 0L
     private var lastSnapshotAt = SystemClock.elapsedRealtime()
-    private var lastFrameTimeMs = 0L
+    private var lastFrameTimeUs = 0L
     private var recording = false
     private var recordedFrames = 0
     private var recordingFull = false
@@ -62,7 +69,7 @@ class CanRecorder {
         synchronized(lock) {
             for (f in frames) {
                 total++
-                lastFrameTimeMs = f.timeMs
+                lastFrameTimeUs = f.timeUs
                 val state = ids.getOrPut(keyOf(f)) { IdState(labelOf(f), f.tx) }
                 if (state.count > 0) {
                     val old = state.data
@@ -114,10 +121,10 @@ class CanRecorder {
 
     /** Adds a "# mark" line at the current position of the recording. */
     fun mark(label: String) = synchronized(lock) {
-        if (recording) entries += Mark(lastFrameTimeMs, label)
+        if (recording) entries += Mark(lastFrameTimeUs, label)
     }
 
-    fun snapshot(lostFrames: Int): MonitorSnapshot = synchronized(lock) {
+    fun snapshot(lostAtChip: Int, lostOnLink: Int, lossSplitKnown: Boolean): MonitorSnapshot = synchronized(lock) {
         val now = SystemClock.elapsedRealtime()
         val seconds = ((now - lastSnapshotAt) / 1000f).coerceAtLeast(0.001f)
         val rows = ids.entries.sortedBy { it.key }.map { (key, s) ->
@@ -136,7 +143,9 @@ class CanRecorder {
             rows = rows,
             framesPerSecond = fps,
             totalFrames = total,
-            lostFrames = lostFrames,
+            lostAtChip = lostAtChip,
+            lostOnLink = lostOnLink,
+            lossSplitKnown = lossSplitKnown,
             recording = recording,
             recordedFrames = recordedFrames,
             recordingMs = if (recording) now - recordStart else recordEnd - recordStart,
@@ -154,9 +163,9 @@ class CanRecorder {
         for (e in copy) {
             sb.setLength(0)
             when (e) {
-                is Mark -> sb.append("# mark ").append(e.timeMs).append(' ').append(e.label)
+                is Mark -> appendMs(sb.append("# mark "), e.timeUs).append(' ').append(e.label)
                 is CanFrame -> {
-                    sb.append(e.timeMs).append('\t').append(labelOf(e)).append('\t').append(e.data.size).append('\t')
+                    appendMs(sb, e.timeUs).append('\t').append(labelOf(e)).append('\t').append(e.data.size).append('\t')
                     if (e.rtr) sb.append("RTR") else e.data.forEach { sb.append(HEX[it.toInt() and 0xFF]).append(' ') }
                     if (e.tx) sb.append("\tTX")
                 }
@@ -164,6 +173,12 @@ class CanRecorder {
             sb.append('\n')
             out.write(sb.toString())
         }
+    }
+
+    /** Writes a microsecond time as milliseconds with two decimals, e.g. 311696.42. */
+    private fun appendMs(sb: StringBuilder, us: Long): StringBuilder {
+        val hundredths = (us % 1000) / 10
+        return sb.append(us / 1000).append('.').append(if (hundredths < 10) "0" else "").append(hundredths)
     }
 
     companion object {

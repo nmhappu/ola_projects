@@ -2,6 +2,7 @@ package dev.appu.bmsremote.ui
 
 import android.app.Application
 import android.net.Uri
+import android.os.SystemClock
 import androidx.core.content.FileProvider
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -11,6 +12,8 @@ import dev.appu.bmsremote.ble.BmsStatus
 import dev.appu.bmsremote.ble.ConnectionState
 import dev.appu.bmsremote.monitor.CanRecorder
 import dev.appu.bmsremote.monitor.MonitorSnapshot
+import dev.appu.bmsremote.monitor.RideData
+import dev.appu.bmsremote.monitor.RideSnapshot
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -57,8 +60,21 @@ class BmsViewModel(app: Application) : AndroidViewModel(app) {
     private var recordingStartedAt: Date? = null
     private var tickerJob: Job? = null
 
+    // ---- Ride mode ----
+    private val rideData = RideData { SystemClock.elapsedRealtimeNanos() / 1000 }
+    private val _ride = MutableStateFlow(RideSnapshot())
+    val ride: StateFlow<RideSnapshot> = _ride.asStateFlow()
+    private var rideOpen = false
+    private var rideJob: Job? = null
+
+    /** The raw CAN stream stays on while any screen or a recording needs it. */
+    private val streamNeeded: Boolean get() = monitorOpen || rideOpen || recorder.isRecording
+
     init {
-        client.rawListener = recorder::onFrames
+        client.rawListener = { frames ->
+            recorder.onFrames(frames)
+            rideData.onFrames(frames)
+        }
         viewModelScope.launch { client.errors.collect { _messages.emit(it) } }
         viewModelScope.launch {
             // The ESP32 bumps commandCounter for every command it handles; report each one once.
@@ -78,7 +94,7 @@ class BmsViewModel(app: Application) : AndroidViewModel(app) {
             combine(connection, canMonitorSupported) { c, supported -> c is ConnectionState.Connected && supported }
                 .collect { ready ->
                     if (!ready) streaming = false
-                    else if (monitorOpen || recorder.isRecording) startStreaming()
+                    else if (streamNeeded) startStreaming()
                 }
         }
     }
@@ -98,7 +114,7 @@ class BmsViewModel(app: Application) : AndroidViewModel(app) {
         if (tickerJob?.isActive != true) {
             tickerJob = viewModelScope.launch {
                 while (isActive) {
-                    _monitor.value = recorder.snapshot(status.value?.rawDropped ?: 0)
+                    _monitor.value = snapshotNow()
                     delay(SNAPSHOT_INTERVAL_MS)
                 }
             }
@@ -109,8 +125,28 @@ class BmsViewModel(app: Application) : AndroidViewModel(app) {
         monitorOpen = false
         tickerJob?.cancel()
         // Keep streaming in the background while a recording is running.
-        if (!recorder.isRecording) stopStreaming()
-        _monitor.value = recorder.snapshot(status.value?.rawDropped ?: 0)
+        if (!streamNeeded) stopStreaming()
+        _monitor.value = snapshotNow()
+    }
+
+    fun openRide() {
+        rideOpen = true
+        rideData.clear()
+        startStreaming()
+        if (rideJob?.isActive != true) {
+            rideJob = viewModelScope.launch {
+                while (isActive) {
+                    _ride.value = rideData.snapshot()
+                    delay(RIDE_FRAME_MS)
+                }
+            }
+        }
+    }
+
+    fun closeRide() {
+        rideOpen = false
+        rideJob?.cancel()
+        if (!streamNeeded) stopStreaming()
     }
 
     fun startRecording() {
@@ -122,7 +158,7 @@ class BmsViewModel(app: Application) : AndroidViewModel(app) {
 
     fun stopRecording() {
         recorder.stopRecording()
-        if (!monitorOpen) stopStreaming()
+        if (!streamNeeded) stopStreaming()
     }
 
     fun discardRecording() = recorder.discardRecording()
@@ -137,7 +173,7 @@ class BmsViewModel(app: Application) : AndroidViewModel(app) {
         val app = getApplication<Application>()
         val started = recordingStartedAt ?: Date()
         val device = (connection.value as? ConnectionState.Connected)?.name ?: "BMS Tool"
-        val snapshot = recorder.snapshot(status.value?.rawDropped ?: 0)
+        val snapshot = snapshotNow()
         viewModelScope.launch {
             try {
                 val uri = withContext(Dispatchers.IO) {
@@ -152,7 +188,12 @@ class BmsViewModel(app: Application) : AndroidViewModel(app) {
                                 "BMS Remote CAN log",
                                 "device: $device",
                                 "started: " + SimpleDateFormat("yyyy-MM-dd HH:mm:ss Z", Locale.US).format(started),
-                                "frames: ${snapshot.recordedFrames}, lost by ESP32: ${snapshot.lostFrames}",
+                                "frames: ${snapshot.recordedFrames}, " + if (snapshot.lossSplitKnown) {
+                                    "lost at CAN chip: ${snapshot.lostAtChip}, lost on Bluetooth: ${snapshot.lostOnLink}"
+                                } else {
+                                    "lost by ESP32: ${snapshot.lostFrames}"
+                                },
+                                "time_ms is the ESP32's clock",
                             ),
                         )
                     }
@@ -163,6 +204,15 @@ class BmsViewModel(app: Application) : AndroidViewModel(app) {
                 _messages.emit("Export failed: ${e.message}")
             }
         }
+    }
+
+    private fun snapshotNow(): MonitorSnapshot {
+        val s = status.value
+        return recorder.snapshot(
+            lostAtChip = s?.rawLostAtChip ?: 0,
+            lostOnLink = s?.rawLostOnLink ?: 0,
+            lossSplitKnown = s?.lossSplitKnown ?: true,
+        )
     }
 
     private fun startStreaming() {
@@ -203,5 +253,6 @@ class BmsViewModel(app: Application) : AndroidViewModel(app) {
 
     private companion object {
         const val SNAPSHOT_INTERVAL_MS = 500L
+        const val RIDE_FRAME_MS = 50L   // 20 updates a second keeps the graphs moving smoothly
     }
 }

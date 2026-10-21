@@ -1,5 +1,5 @@
-// ESP32 DevKit (WROOM-32) BLE version of the Ola S1 X BMS tool from backup.hex,
-// for the MCP2515 CAN module (the one the original Uno tool used).
+// ESP32 DevKit (WROOM-32) BLE version of the Ola S1 X / S1 Air BMS tool from
+// backup.hex, for the MCP2515 CAN module (the one the original Uno tool used).
 // Works with the same Android app ("BMS Remote") as esp32_sn65hvd230: the
 // Bluetooth protocol is identical, only the CAN hardware differs.
 //
@@ -12,9 +12,15 @@
 //
 // Wiring (see WIRING.md, which also maps the old Uno pins):
 //   CS -> GPIO 5, SO (MISO) -> GPIO 19, SI (MOSI) -> GPIO 23, SCK -> GPIO 18,
-//   VCC -> 5V (VIN), GND -> GND, INT not used.
+//   INT -> GPIO 4 through a divider (10 kOhm in series, 20 kOhm to GND),
+//   VCC -> 5V (VIN), GND -> GND.
 //   The module runs at 5 V; a level shifter on CS/SO/SI/SCK keeps the ESP32
 //   within spec. For a no-shifter build use esp32_sn65hvd230 instead.
+//
+// Receiving: the MCP2515 holds only 2 frames, and on a busy bus a third can
+// arrive within ~0.5 ms. Its INT pin wakes a dedicated high-priority task that
+// empties the chip at once with the fast "read RX buffer" command. Without the
+// INT wire the task falls back to polling every 1 ms (more frames lost).
 //
 // BLE security: the app must pair with PASSKEY below (Android asks for it once).
 // Change it before use. Unpaired phones cannot send commands or read data.
@@ -24,8 +30,7 @@
 //
 // CAN monitor: on request the board also forwards every CAN frame it sees (and
 // the frames it sends itself, flagged TX) to the app, which shows, records and
-// exports them for can_tools/analyze_cells.py. The MCP2515 only buffers 2
-// frames, so on a busy bus some may be lost; the app shows how many.
+// exports them for can_tools/analyze_cells.py.
 //
 // Libraries: arduino-mcp2515 by autowp. BLE comes with the ESP32 core (3.x).
 
@@ -41,16 +46,19 @@
 const uint32_t PASSKEY   = 246810;      // 6 digits, entered on the phone when pairing
 const char *NAME_PREFIX  = "OLA BMS Tool";
 const int PIN_CAN_CS     = 5;
+const int PIN_CAN_INT    = 4;           // MCP2515 INT (5 V) through a 10k/20k divider
+const uint32_t SPI_CLOCK = 10000000;    // the MCP2515's maximum
 const uint32_t NOTIFY_INTERVAL_MS = 250;
 const uint32_t DATA_TIMEOUT_MS    = 2000;  // no 0x1A8/0x352 frame for this long -> "No CAN data"
-const uint32_t RAW_NOTIFY_MS      = 8;     // at most one CAN monitor packet this often
+const uint32_t RAW_NOTIFY_MS      = 5;     // at most one CAN monitor packet this often
+const uint32_t ERROR_CHECK_MS     = 20;    // how often to check the chip's overflow flags
 const uint32_t TX_CHECK_MS        = 50;    // how long to watch for "nobody acknowledged" after a send
 
 // ---- BLE protocol (keep in sync with the Android app, BmsProtocol.kt) ----
 #define SERVICE_UUID "8d3a0001-6c2b-4f6e-9b6a-2f1c5e7a4b10"
 #define COMMAND_UUID "8d3a0002-6c2b-4f6e-9b6a-2f1c5e7a4b10"  // write, 1-3 bytes
-#define STATUS_UUID  "8d3a0003-6c2b-4f6e-9b6a-2f1c5e7a4b10"  // read + notify, 10 bytes
-#define RAW_UUID     "8d3a0004-6c2b-4f6e-9b6a-2f1c5e7a4b10"  // notify, CAN monitor records
+#define STATUS_UUID  "8d3a0003-6c2b-4f6e-9b6a-2f1c5e7a4b10"  // read + notify, 12 bytes
+#define RAW_UUID     "8d3a0004-6c2b-4f6e-9b6a-2f1c5e7a4b10"  // notify, CAN monitor packets
 
 enum Command : uint8_t {
   CMD_BMS_RESET    = 0x01,
@@ -70,31 +78,46 @@ enum SendResult : uint8_t {
   SEND_NO_ACK    = 4,   // nobody acknowledged it: scooter off or CAN-H/L not connected
 };
 
-// Status packet:
-//   [0..1] pack voltage, mV, little-endian
-//   [2]    SOC, %
-//   [3]    flags: bit0 = live streaming on, bit1 = CAN data is fresh, bit2 = CAN monitor on
-//   [4]    last command id (0 = none yet)
-//   [5]    last command result (SendResult)
-//   [6]    command counter (increments for every command handled)
-//   [7]    protocol version
-//   [8..9] CAN monitor frames lost since it started (u16 LE, stops at 65535)
-const uint8_t PROTOCOL_VERSION = 2;
+// Status packet (protocol 3):
+//   [0..1]   pack voltage, mV, little-endian
+//   [2]      SOC, %
+//   [3]      flags: bit0 = live streaming on, bit1 = CAN data is fresh, bit2 = CAN monitor on
+//   [4]      last command id (0 = none yet)
+//   [5]      last command result (SendResult)
+//   [6]      command counter (increments for every command handled)
+//   [7]      protocol version
+//   [8..9]   CAN monitor: frames lost at the CAN chip (u16 LE, stops at 65535; each
+//            MCP2515 overflow counts once, so this is "at least")
+//   [10..11] CAN monitor: frames lost on the Bluetooth link (u16 LE, stops at 65535)
+const uint8_t PROTOCOL_VERSION = 3;
 const uint8_t FLAG_LIVE  = 0x01;
 const uint8_t FLAG_FRESH = 0x02;
 const uint8_t FLAG_RAW   = 0x04;
 
-// CAN monitor record, 17 bytes, several per notification:
-//   [0..3] time, ms since boot (u32 LE)
-//   [4..7] id (u32 LE), bit31 = extended (29-bit), bit30 = remote frame
-//   [8]    dlc, bit7 set = sent by this tool   [9..16] data (unused bytes 0)
-// can_frame.can_id already uses that layout (CAN_EFF_FLAG / CAN_RTR_FLAG).
-const uint8_t RAW_RECORD_SIZE = 17;
-const uint8_t RAW_MAX_PER_PACKET = 14;   // 238 bytes, fits a 247-byte MTU
-const uint8_t RAW_TX_FLAG = 0x80;
+// CAN monitor packet (protocol 3):
+//   [0]      format = 0x03
+//   [1..4]   base time, microseconds since boot (u32 LE, wraps every ~71 minutes)
+//   then records, each:
+//     [0]    flags: bits0-3 = dlc, bit5 = remote frame, bit6 = 29-bit id, bit7 = sent by this tool
+//     [1..2] time after the base, in 10 us steps (u16 LE)
+//     [..]   id: 2 bytes (11-bit) or 4 bytes (29-bit), LE
+//     [..]   data: dlc bytes (none for remote frames)
+// An 8-byte standard frame takes 13 bytes, so 18 fit a 247-byte MTU.
+const uint8_t RAW_FORMAT = 0x03;
+const uint8_t REC_RTR = 0x20, REC_EXT = 0x40, REC_TX = 0x80;
+const uint16_t RAW_MAX_PAYLOAD = 244;
 
-MCP2515 mcp2515(PIN_CAN_CS);
-struct can_frame rxFrame;
+// MCP2515 SPI commands (datasheet; the library keeps its copies private)
+const uint8_t SPI_READ_STATUS = 0xA0;   // returns RX0IF in bit 0, RX1IF in bit 1
+const uint8_t SPI_READ_RX0    = 0x90;   // read receive buffer 0 from its first id byte
+const uint8_t SPI_READ_RX1    = 0x94;   // read receive buffer 1 from its first id byte
+const uint8_t STATUS_RX0      = 0x01;
+const uint8_t STATUS_RX1      = 0x02;
+
+MCP2515 mcp2515(PIN_CAN_CS, SPI_CLOCK);
+SPISettings spiSettings(SPI_CLOCK, MSBFIRST, SPI_MODE0);
+SemaphoreHandle_t spiMutex;              // the receive task and loop() both talk to the chip
+TaskHandle_t canTaskHandle;
 
 BLEServer *server;
 BLECharacteristic *statusChar;
@@ -104,88 +127,204 @@ volatile uint8_t pendingCommand = 0;   // set by the BLE task, handled in loop()
 volatile uint8_t pendingArg[2] = {0, 0};
 volatile bool clientConnected = false;
 
-uint16_t rawVoltage = 0;   // mV
-uint8_t soc = 0;           // %
+volatile uint16_t rawVoltage = 0;   // mV
+volatile uint8_t soc = 0;           // %
+volatile uint32_t lastDataMs = 0;
+volatile bool haveData = false;
 bool live = false;
-uint32_t lastDataMs = 0;
-bool haveData = false;
 uint8_t lastCommand = 0;
 uint8_t lastResult = 0;
 uint8_t commandCounter = 0;
 uint32_t lastNotifyMs = 0;
 
-// Frames waiting to go to the phone (ring buffer, loop() only).
+// Frames waiting to go to the phone. Written by the receive task and by sendCAN(),
+// read by loop(); the write side is guarded by a spinlock.
 struct RawRecord {
-  uint32_t t;
-  struct can_frame frame;
-  bool tx;
+  uint32_t us;
+  uint32_t id;
+  uint8_t flags;        // dlc | REC_* bits
+  uint8_t data[8];
 };
 const uint16_t RAW_BUFFER = 1024;
 RawRecord rawBuffer[RAW_BUFFER];
-uint16_t rawHead = 0, rawTail = 0;     // head = next write, tail = next send
-bool rawStreaming = false;
-uint8_t rawPerPacket = 1;
-uint16_t rawDropped = 0;
+volatile uint16_t rawHead = 0, rawTail = 0;   // head = next write, tail = next send
+portMUX_TYPE rawLock = portMUX_INITIALIZER_UNLOCKED;
+volatile bool rawStreaming = false;
+uint16_t rawMaxPayload = 20;
+volatile uint16_t lostAtChip = 0;
+volatile uint16_t lostOnLink = 0;
 uint32_t lastRawNotifyMs = 0;
 
 // ---------------------------------------------------------------- CAN monitor
 
-void countDropped() {
-  if (rawDropped < 0xFFFF) rawDropped++;
+void bump(volatile uint16_t &counter) {
+  if (counter < 0xFFFF) counter = counter + 1;
 }
 
-void pushRaw(const struct can_frame &frame, bool tx) {
+void pushRaw(uint32_t us, uint32_t id, uint8_t flags, const uint8_t *data) {
   if (!rawStreaming) return;
+  portENTER_CRITICAL(&rawLock);
   uint16_t next = (rawHead + 1) % RAW_BUFFER;
-  if (next == rawTail) {   // phone is not keeping up
-    countDropped();
-    return;
+  if (next == rawTail) {
+    bump(lostOnLink);   // the phone is not keeping up
+  } else {
+    RawRecord &r = rawBuffer[rawHead];
+    r.us = us;
+    r.id = id;
+    r.flags = flags;
+    memcpy(r.data, data, 8);
+    rawHead = next;
   }
-  rawBuffer[rawHead] = {millis(), frame, tx};
-  rawHead = next;
+  portEXIT_CRITICAL(&rawLock);
 }
 
-// Sends up to rawPerPacket buffered frames in one notification.
+// Sends as many buffered frames as fit one notification.
 void flushRaw() {
   if (!rawStreaming || !clientConnected || rawHead == rawTail) return;
   if (millis() - lastRawNotifyMs < RAW_NOTIFY_MS) return;
   lastRawNotifyMs = millis();
 
-  uint8_t packet[RAW_RECORD_SIZE * RAW_MAX_PER_PACKET];
-  uint8_t count = 0;
-  while (count < rawPerPacket && rawTail != rawHead) {
+  uint8_t packet[RAW_MAX_PAYLOAD];
+  uint16_t len = 5;
+  uint32_t base = rawBuffer[rawTail].us;
+  packet[0] = RAW_FORMAT;
+  for (int i = 0; i < 4; i++) packet[1 + i] = (base >> (8 * i)) & 0xFF;
+
+  while (rawTail != rawHead) {
     const RawRecord &r = rawBuffer[rawTail];
-    uint8_t *p = packet + count * RAW_RECORD_SIZE;
-    memset(p, 0, RAW_RECORD_SIZE);
-    for (int i = 0; i < 4; i++) {
-      p[i] = (r.t >> (8 * i)) & 0xFF;
-      p[4 + i] = (r.frame.can_id >> (8 * i)) & 0xFF;
-    }
-    uint8_t dlc = r.frame.can_dlc > 8 ? 8 : r.frame.can_dlc;
-    p[8] = dlc | (r.tx ? RAW_TX_FLAG : 0);
-    if (!(r.frame.can_id & CAN_RTR_FLAG)) memcpy(p + 9, r.frame.data, dlc);
+    uint8_t dlc = r.flags & 0x0F;
+    bool ext = r.flags & REC_EXT;
+    uint8_t dataLen = (r.flags & REC_RTR) ? 0 : dlc;
+    uint16_t size = 3 + (ext ? 4 : 2) + dataLen;
+    uint32_t dt = (r.us - base) / 10;
+    if (len + size > rawMaxPayload || dt > 0xFFFF) break;   // next packet gets a new base
+    uint8_t *p = packet + len;
+    p[0] = r.flags;
+    p[1] = dt & 0xFF;
+    p[2] = dt >> 8;
+    p += 3;
+    for (int i = 0; i < (ext ? 4 : 2); i++) *p++ = (r.id >> (8 * i)) & 0xFF;
+    memcpy(p, r.data, dataLen);
+    len += size;
     rawTail = (rawTail + 1) % RAW_BUFFER;
-    count++;
   }
-  rawChar->setValue(packet, count * RAW_RECORD_SIZE);
+  rawChar->setValue(packet, len);
   rawChar->notify();
 }
 
 void startRaw(uint16_t maxPayload) {
-  uint16_t fits = maxPayload / RAW_RECORD_SIZE;
-  rawPerPacket = fits < 1 ? 1 : (fits > RAW_MAX_PER_PACKET ? RAW_MAX_PER_PACKET : fits);
-  rawHead = rawTail = 0;
-  rawDropped = 0;
+  rawMaxPayload = maxPayload < 20 ? 20 : (maxPayload > RAW_MAX_PAYLOAD ? RAW_MAX_PAYLOAD : maxPayload);
+  portENTER_CRITICAL(&rawLock);
+  rawHead = 0;
+  rawTail = 0;
+  portEXIT_CRITICAL(&rawLock);
+  lostAtChip = 0;
+  lostOnLink = 0;
   rawStreaming = true;
 }
 
 // ---------------------------------------------------------------- CAN (MCP2515)
 
 void setupCAN() {
-  SPI.begin();
-  mcp2515.reset();
+  mcp2515.reset();   // also enables the RX0/RX1/error interrupts on INT
   mcp2515.setBitrate(CAN_500KBPS, MCP_8MHZ);
   mcp2515.setNormalMode();
+}
+
+uint8_t readStatus() {
+  SPI.beginTransaction(spiSettings);
+  digitalWrite(PIN_CAN_CS, LOW);
+  SPI.transfer(SPI_READ_STATUS);
+  uint8_t status = SPI.transfer(0x00);
+  digitalWrite(PIN_CAN_CS, HIGH);
+  SPI.endTransaction();
+  return status;
+}
+
+// Reads a receive buffer's 13 bytes (id, dlc, data). The chip clears that
+// buffer's "full" flag by itself when CS goes high, so no extra command is needed.
+void readRxBuffer(uint8_t instruction, uint8_t *out) {
+  SPI.beginTransaction(spiSettings);
+  digitalWrite(PIN_CAN_CS, LOW);
+  SPI.transfer(instruction);
+  for (int i = 0; i < 13; i++) out[i] = SPI.transfer(0x00);
+  digitalWrite(PIN_CAN_CS, HIGH);
+  SPI.endTransaction();
+}
+
+void handleFrame(const uint8_t *b, uint32_t us) {
+  bool ext = b[1] & 0x08;
+  uint32_t id = ((uint32_t)b[0] << 3) | (b[1] >> 5);
+  bool rtr;
+  if (ext) {
+    id = (id << 18) | ((uint32_t)(b[1] & 0x03) << 16) | ((uint32_t)b[2] << 8) | b[3];
+    rtr = b[4] & 0x40;
+  } else {
+    rtr = b[1] & 0x10;
+  }
+  uint8_t dlc = b[4] & 0x0F;
+  if (dlc > 8) dlc = 8;
+  const uint8_t *data = b + 5;
+  pushRaw(us, id, dlc | (rtr ? REC_RTR : 0) | (ext ? REC_EXT : 0), data);
+
+  if (ext || rtr) return;
+  if (id == 0x1A8 && dlc >= 6) {
+    rawVoltage = data[4] | (data[5] << 8);
+    lastDataMs = millis();
+    haveData = true;
+  } else if (id == 0x352 && dlc >= 1) {
+    soc = data[0];
+    lastDataMs = millis();
+    haveData = true;
+  }
+}
+
+// Counts receive overflows and clears the error interrupt so INT can signal again.
+// (Not clearRXnOVR(): that also wipes the "frame waiting" flags and drops frames.)
+void checkErrors() {
+  xSemaphoreTake(spiMutex, portMAX_DELAY);
+  uint8_t eflg = mcp2515.getErrorFlags();
+  uint8_t intf = mcp2515.getInterrupts();
+  if (eflg & (MCP2515::EFLG_RX0OVR | MCP2515::EFLG_RX1OVR)) {
+    if (rawStreaming) bump(lostAtChip);
+    mcp2515.clearRXnOVRFlags();
+  }
+  if (intf & MCP2515::CANINTF_ERRIF) mcp2515.clearERRIF();
+  if (intf & MCP2515::CANINTF_MERRF) mcp2515.clearMERR();
+  xSemaphoreGive(spiMutex);
+}
+
+void IRAM_ATTR onCanInterrupt() {
+  BaseType_t woken = pdFALSE;
+  vTaskNotifyGiveFromISR(canTaskHandle, &woken);
+  if (woken) portYIELD_FROM_ISR();
+}
+
+// Empties the chip whenever INT fires (or every 1 ms if INT is not wired).
+void canTask(void *) {
+  uint32_t lastErrorCheck = 0;
+  uint8_t b0[13], b1[13];
+  for (;;) {
+    ulTaskNotifyTake(pdTRUE, 1);
+    for (;;) {
+      xSemaphoreTake(spiMutex, portMAX_DELAY);
+      uint32_t us = micros();
+      uint8_t status = readStatus();
+      bool has0 = status & STATUS_RX0;
+      bool has1 = status & STATUS_RX1;
+      if (has0) readRxBuffer(SPI_READ_RX0, b0);
+      if (has1) readRxBuffer(SPI_READ_RX1, b1);
+      xSemaphoreGive(spiMutex);
+      if (!has0 && !has1) break;
+      if (has0) handleFrame(b0, us);
+      if (has1) handleFrame(b1, us);
+    }
+    // INT still low with both buffers empty means an error flag is holding it down.
+    if (digitalRead(PIN_CAN_INT) == LOW || millis() - lastErrorCheck >= ERROR_CHECK_MS) {
+      lastErrorCheck = millis();
+      checkErrors();
+    }
+  }
 }
 
 // Sends an 8-byte frame with all data bytes 0x00.
@@ -195,7 +334,10 @@ uint8_t sendCAN(uint32_t id) {
   struct can_frame tx = {};
   tx.can_id = id;
   tx.can_dlc = 8;
+  uint32_t sentAt = micros();
+  xSemaphoreTake(spiMutex, portMAX_DELAY);
   MCP2515::ERROR err = mcp2515.sendMessage(&tx);
+  xSemaphoreGive(spiMutex);
   if (err == MCP2515::ERROR_ALLTXBUSY) return SEND_BUSY;
   if (err != MCP2515::ERROR_OK) return SEND_FAILED;
 
@@ -203,56 +345,38 @@ uint8_t sendCAN(uint32_t id) {
   // listening its error counter climbs to "error passive" within a few ms.
   uint32_t start = millis();
   while (millis() - start < TX_CHECK_MS) {
+    xSemaphoreTake(spiMutex, portMAX_DELAY);
     uint8_t flags = mcp2515.getErrorFlags();
     if (flags & (MCP2515::EFLG_TXBO | MCP2515::EFLG_TXEP)) {
-      // Restarting the chip cancels the endless retries and clears the counters.
-      setupCAN();
+      setupCAN();   // restarting the chip cancels the endless retries and clears the counters
+      xSemaphoreGive(spiMutex);
       return (flags & MCP2515::EFLG_TXBO) ? SEND_BUS_OFF : SEND_NO_ACK;
     }
+    xSemaphoreGive(spiMutex);
     delay(2);
   }
-  pushRaw(tx, true);   // so the monitor log shows when the tool sent it
+  pushRaw(sentAt, id, 8 | REC_TX, tx.data);   // so the monitor log shows when the tool sent it
   return SEND_OK;
-}
-
-// Drains every waiting frame and keeps the latest voltage / SOC.
-void pollCAN() {
-  // The MCP2515 holds only 2 frames; if both were full when a third arrived, it was lost.
-  uint8_t errors = mcp2515.getErrorFlags();
-  if (errors & (MCP2515::EFLG_RX0OVR | MCP2515::EFLG_RX1OVR)) {
-    if (rawStreaming) countDropped();
-    mcp2515.clearRXnOVR();
-  }
-  while (mcp2515.readMessage(&rxFrame) == MCP2515::ERROR_OK) {
-    pushRaw(rxFrame, false);
-    if (rxFrame.can_id == 0x1A8 && rxFrame.can_dlc >= 6) {
-      rawVoltage = rxFrame.data[4] | (rxFrame.data[5] << 8);
-      lastDataMs = millis();
-      haveData = true;
-    } else if (rxFrame.can_id == 0x352 && rxFrame.can_dlc >= 1) {
-      soc = rxFrame.data[0];
-      lastDataMs = millis();
-      haveData = true;
-    }
-  }
 }
 
 // ---------------------------------------------------------------- BLE
 
 void publishStatus(bool notify) {
   bool fresh = haveData && millis() - lastDataMs < DATA_TIMEOUT_MS;
-  uint16_t lost = rawStreaming ? rawDropped : 0;
-  uint8_t packet[10] = {
-    (uint8_t)(rawVoltage & 0xFF),
-    (uint8_t)(rawVoltage >> 8),
+  uint16_t v = rawVoltage;
+  uint8_t packet[12] = {
+    (uint8_t)(v & 0xFF),
+    (uint8_t)(v >> 8),
     soc,
     (uint8_t)((live ? FLAG_LIVE : 0) | (fresh ? FLAG_FRESH : 0) | (rawStreaming ? FLAG_RAW : 0)),
     lastCommand,
     lastResult,
     commandCounter,
     PROTOCOL_VERSION,
-    (uint8_t)(lost & 0xFF),
-    (uint8_t)(lost >> 8),
+    (uint8_t)(lostAtChip & 0xFF),
+    (uint8_t)(lostAtChip >> 8),
+    (uint8_t)(lostOnLink & 0xFF),
+    (uint8_t)(lostOnLink >> 8),
   };
   statusChar->setValue(packet, sizeof(packet));
   if (notify && clientConnected)
@@ -379,15 +503,24 @@ void setupBLE() {
 
 void setup() {
   Serial.begin(115200);
+
+  spiMutex = xSemaphoreCreateMutex();
+  pinMode(PIN_CAN_CS, OUTPUT);
+  digitalWrite(PIN_CAN_CS, HIGH);
+  SPI.begin();
   setupCAN();
+
+  // Receive task on core 1 (Bluetooth runs on core 0), above loop()'s priority.
+  xTaskCreatePinnedToCore(canTask, "can_rx", 4096, nullptr, 5, &canTaskHandle, 1);
+  pinMode(PIN_CAN_INT, INPUT_PULLUP);   // pull-up keeps it idle if INT isn't wired
+  attachInterrupt(digitalPinToInterrupt(PIN_CAN_INT), onCanInterrupt, FALLING);
+
   setupBLE();
   Serial.printf("%s (MCP2515) ready, advertising over BLE (address %s)\n",
                 deviceName, BLEDevice::getAddress().toString().c_str());
 }
 
 void loop() {
-  pollCAN();
-
   uint8_t cmd = pendingCommand;
   if (cmd != 0) {
     pendingCommand = 0;
@@ -402,5 +535,5 @@ void loop() {
     publishStatus(live || rawStreaming);
   }
 
-  delay(rawStreaming ? 1 : 2);   // poll faster while monitoring: the MCP2515 only buffers 2 frames
+  delay(1);   // receiving runs in its own task; this loop only sends to the phone
 }
